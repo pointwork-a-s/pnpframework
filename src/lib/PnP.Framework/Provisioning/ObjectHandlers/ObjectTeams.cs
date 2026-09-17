@@ -949,11 +949,18 @@ namespace PnP.Framework.Provisioning.ObjectHandlers
 
             var existingChannels = GetExistingTeamChannels(teamId, accessToken, graphBaseUri);
 
+            // The primary channel is created as "General" but may have been renamed. Its id is stable, so
+            // match the template's "General" entry to it by id — otherwise a renamed primary channel is not
+            // found and a duplicate "General" is created.
+            var primaryChannelId = GetPrimaryChannelId(teamId, accessToken, graphBaseUri);
+
             foreach (var channel in team.Channels)
             {
-                var existingChannel = existingChannels.FirstOrDefault(x => x["displayName"].ToString() == parser.ParseString(channel.DisplayName));
+                var existingChannel = (channel.DisplayName.Equals("General", StringComparison.InvariantCultureIgnoreCase) && primaryChannelId != null)
+                    ? existingChannels.FirstOrDefault(x => x["id"].ToString() == primaryChannelId)
+                    : existingChannels.FirstOrDefault(x => x["displayName"].ToString() == parser.ParseString(channel.DisplayName));
 
-                var channelId = existingChannel == null ? CreateTeamChannel(scope, channel, teamId, accessToken, parser, graphBaseUri) : UpdateTeamChannel(channel, teamId, existingChannel, accessToken, parser, graphBaseUri);
+                var channelId = existingChannel == null ? CreateTeamChannel(scope, channel, teamId, accessToken, parser, graphBaseUri) : UpdateTeamChannel(channel, teamId, existingChannel, primaryChannelId, accessToken, parser, graphBaseUri);
 
                 if (channelId == null) return false;
 
@@ -1011,13 +1018,47 @@ namespace PnP.Framework.Provisioning.ObjectHandlers
             return JToken.Parse(channels)["value"];
         }
 
-        private static string UpdateTeamChannel(Model.Teams.TeamChannel channel, string teamId, JToken existingChannel, string accessToken, TokenParser parser, Uri graphBaseUri)
+        /// <summary>
+        /// Returns the id of the team's primary channel, or null if it cannot be read. The primary channel
+        /// is created as "General" but may have been renamed; its id is stable, so callers use it to locate
+        /// the primary channel regardless of its current display name. (GET /primaryChannel reports the id
+        /// reliably even though its displayName always reads "General".)
+        /// </summary>
+        private static string GetPrimaryChannelId(string teamId, string accessToken, Uri graphBaseUri)
         {
-            // Not supported to update 'General' Channel
-            if (channel.DisplayName.Equals("General", StringComparison.InvariantCultureIgnoreCase))
-                return existingChannel["id"].ToString();
+            if (graphBaseUri == null)
+            {
+                graphBaseUri = new Uri(GraphHelper.MicrosoftGraphBaseURI);
+            }
 
+            try
+            {
+                var json = HttpHelper.MakeGetRequestForString($"{graphBaseUri}v1.0/teams/{teamId}/primaryChannel?$select=id", accessToken);
+                if (!string.IsNullOrEmpty(json))
+                {
+                    return JToken.Parse(json)["id"]?.ToString();
+                }
+            }
+            catch (Exception)
+            {
+                // Fall back to display-name matching when the primary channel can't be read.
+            }
+
+            return null;
+        }
+
+        private static string UpdateTeamChannel(Model.Teams.TeamChannel channel, string teamId, JToken existingChannel, string primaryChannelId, string accessToken, TokenParser parser, Uri graphBaseUri)
+        {
             var channelId = existingChannel["id"].ToString();
+
+            // The primary channel rejects any PATCH containing description (400 SetThreadPropertiesS2SRequest)
+            // and cannot be renamed through this path; leave its name/description alone (only its tabs/messages
+            // are applied by the caller). Keyed on the primary channel id so it holds whatever the template
+            // calls the channel; the "General" name check is a fallback for when the id could not be read.
+            if ((primaryChannelId != null && channelId == primaryChannelId)
+                || channel.DisplayName.Equals("General", StringComparison.InvariantCultureIgnoreCase))
+                return channelId;
+
             var channelDisplayName = existingChannel["displayName"].ToString();
             var newChannelName = parser.ParseString(channel.DisplayName);
             var identicalChannelName = newChannelName == channelDisplayName;
